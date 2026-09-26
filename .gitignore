@@ -1,0 +1,36 @@
+# Secrets
+.env
+.env.*
+
+# Keep the environment template
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Research data is local-only pending an explicit release decision.
+# This covers benchmark text, gold labels, canonical artifacts, evaluations,
+# model traces, review excerpts, source documents, and historical outputs.
+data/**
+archive/**
+
+# Keep only documentation that does not disclose case-level data.
+!data/DATASET_CARD.md
+!data/review/
+data/review/**
+!data/review/PROTOCOL.md
+
+# The frozen/draft taxonomy is also a research data artifact.
+taxonomy/**
