@@ -56,3 +56,60 @@ python3 scripts/evaluate_allocation.py \
   --output-json data/eval/allocation_dev_b0.json \
   --output-md data/eval/allocation_dev_b0.md
 ```
+
+B2 reuses the same model and allocation schema, adding only deterministic
+BM25 top-5 context from `data/legal_corpus/normalized/statutes.jsonl`:
+
+```bash
+python3 scripts/run.py allocate \
+  --method b2 \
+  --split development \
+  --output data/runs/allocation_dev_b2.jsonl \
+  --trace data/runs/allocation_dev_b2.trace.jsonl
+```
+
+B4 changes only retrieval: it fuses BM25 and Voyage dense candidate rankings
+with reciprocal rank fusion, then supplies the fused top-5 to the same direct
+allocation LLM and allocation schema used by B2. Corpus embeddings are cached
+locally under the ignored `data/cache/` directory.
+
+```bash
+# No credentials or API calls; uses deterministic fake embeddings.
+python3 scripts/run.py allocate --method b4 --split development --limit 1 --dry-run
+
+# Actual development experiment (run by the researcher after review).
+python3 scripts/run.py allocate \
+  --method b4 \
+  --split development \
+  --output data/runs/allocation_dev_b4.jsonl \
+  --trace data/runs/allocation_dev_b4.trace.jsonl
+```
+
+B4 has no structured extraction, issue classification, planning, deterministic
+execution, verification, answer repair, or abstention stage.
+
+### B5 — Coordinated Modular LLM
+
+B5 keeps B4's frozen hybrid retrieval unchanged and replaces the single direct
+allocation call with four coordinated LLM calls: structured case extraction,
+inheritance-issue analysis, statute-aware reasoning, and coordinated final
+allocation. The final module uses the same allocation schema and evaluator as
+B0/B2/B4. Traces retain every intermediate output, response ID, module usage,
+total usage, execution order, retrieval IDs, validation errors, and runtime
+errors.
+
+```bash
+# Offline construction check using deterministic fake embeddings.
+python3 scripts/run.py allocate --method b5 --split development --limit 1 --dry-run
+
+# Actual development experiment (run only after implementation review).
+python3 scripts/run.py allocate \
+  --method b5 \
+  --split development \
+  --output data/runs/allocation_dev_b5.jsonl \
+  --trace data/runs/allocation_dev_b5.trace.jsonl
+```
+
+B5 is an LLM coordination baseline, not IGEP: it has no deterministic executor,
+executable operation plan, post-execution verifier, repair/re-execution loop, or
+formal abstention mechanism.

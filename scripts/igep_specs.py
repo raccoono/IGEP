@@ -433,6 +433,245 @@ def direct_allocation_user_prompt(case_id: str, query: str) -> str:
     return f"case_id: {case_id}\n\nTình huống:\n{query}\n\nHãy trả kết quả phân chia cuối cùng."
 
 
+B2_ALLOCATION_PROMPT_VERSION = "b2_bm25_v1"
+B2_ALLOCATION_SYSTEM_PROMPT = """\
+Bạn giải quyết bài toán phân chia di sản thừa kế Việt Nam từ đầu đến cuối.
+
+Bạn được cung cấp tình huống và các đoạn văn bản luật do BM25 truy xuất. Chỉ sử
+dụng dữ kiện trong tình huống; văn bản luật chỉ là căn cứ pháp lý, không phải dữ
+kiện vụ việc. Trả về đúng JSON schema được yêu cầu. `allocations` chỉ gồm người
+cuối cùng nhận giá trị và số tiền VND nguyên, không âm. Luôn đưa ra phương án
+phân chia trực tiếp tốt nhất. Không tạo structured extraction, issue profile,
+execution plan, tool call hoặc verifier output. Không được xem hoặc suy đoán đáp
+án tham chiếu.
+"""
+
+
+def b2_allocation_user_prompt(
+    case_id: str, query: str, retrieved_statutes: list[dict[str, Any]]
+) -> str:
+    context = "\n\n".join(
+        "\n".join(
+            [
+                f"[STATUTE {rank}] {row['id']}",
+                f"Văn bản: {row['metadata'].get('document_title', '')}",
+                f"Hiệu lực: {row['metadata'].get('effective_from')} đến "
+                f"{row['metadata'].get('effective_to')}",
+                row["text"],
+            ]
+        )
+        for rank, row in enumerate(retrieved_statutes, 1)
+    )
+    return (
+        f"case_id: {case_id}\n\n"
+        f"Tình huống:\n{query}\n\n"
+        f"Văn bản luật BM25 truy xuất:\n{context}\n\n"
+        "Hãy trực tiếp trả kết quả phân chia cuối cùng. Trong `cited_articles`, "
+        "ghi số điều luật thực sự dùng."
+    )
+
+
+B4_ALLOCATION_PROMPT_VERSION = "b4_hybrid_v1"
+B4_ALLOCATION_SYSTEM_PROMPT = """\
+Bạn giải quyết bài toán phân chia di sản thừa kế Việt Nam từ đầu đến cuối.
+
+Bạn được cung cấp tình huống và các đoạn văn bản luật do truy xuất hybrid BM25
+và dense cung cấp. Chỉ sử dụng dữ kiện trong tình huống; văn bản luật chỉ là căn
+cứ pháp lý, không phải dữ kiện vụ việc. Trả về đúng JSON schema được yêu cầu.
+`allocations` chỉ gồm người cuối cùng nhận giá trị và số tiền VND nguyên, không
+âm. Luôn đưa ra phương án phân chia trực tiếp tốt nhất. Không tạo structured
+extraction, issue profile, execution plan, tool call hoặc verifier output. Không
+được xem hoặc suy đoán đáp án tham chiếu.
+"""
+
+
+def b4_allocation_user_prompt(
+    case_id: str, query: str, retrieved_statutes: list[dict[str, Any]]
+) -> str:
+    """Use the B2 direct-allocation structure with fused statute context."""
+    context = "\n\n".join(
+        "\n".join(
+            [
+                f"[STATUTE {rank}] {row['id']}",
+                f"Văn bản: {row['metadata'].get('document_title', '')}",
+                f"Hiệu lực: {row['metadata'].get('effective_from')} đến "
+                f"{row['metadata'].get('effective_to')}",
+                row["text"],
+            ]
+        )
+        for rank, row in enumerate(retrieved_statutes, 1)
+    )
+    return (
+        f"case_id: {case_id}\n\n"
+        f"Tình huống:\n{query}\n\n"
+        f"Văn bản luật hybrid truy xuất:\n{context}\n\n"
+        "Hãy trực tiếp trả kết quả phân chia cuối cùng. Trong `cited_articles`, "
+        "ghi số điều luật thực sự dùng."
+    )
+
+
+B5_PROMPT_VERSION = "b5_modular_v1"
+B5_MODULE_ORDER = [
+    "structured_case_extraction",
+    "inheritance_issue_analysis",
+    "statute_aware_reasoning",
+    "coordinated_final_allocation",
+]
+
+B5_EXTRACTION_SYSTEM_PROMPT = """\
+Bạn là module trích xuất dữ kiện của baseline B5. Chỉ ghi dữ kiện được nêu rõ
+trong tình huống: người, quan hệ, cái chết/mở thừa kế, tài sản, nghĩa vụ, di
+chúc, tặng cho, chuyển giao và ngày tháng. Không suy luận người thừa kế, điều
+luật hoặc kết quả chia. Ghi rõ thông tin thiếu hay không chắc chắn. Chỉ trả JSON
+đúng schema.
+"""
+
+B5_ISSUE_SYSTEM_PROMPT = """\
+Bạn là module phân tích vấn đề thừa kế của baseline B5. Dùng tình huống, dữ kiện
+đã trích xuất và văn bản luật truy xuất để xác định các vấn đề pháp lý được dữ
+kiện kích hoạt. Giải thích liên kết dữ kiện-vấn đề. Không đưa ra kết quả phân bổ
+cuối cùng. Không tạo execution plan hay gọi công cụ. Chỉ trả JSON đúng schema.
+"""
+
+B5_REASONING_SYSTEM_PROMPT = """\
+Bạn là module lập luận pháp luật của baseline B5. Dùng dữ kiện có cấu trúc, phân
+tích vấn đề và văn bản luật truy xuất để trình bày các bước lập luận, điều luật,
+phép tính và trạng thái thừa kế trung gian. Đánh dấu rõ giả định và điểm chưa
+giải quyết. Không trả output allocation cuối cùng, không tạo executable plan,
+không dùng deterministic executor và không tự kiểm chứng/sửa lại. Chỉ trả JSON
+đúng schema.
+"""
+
+B5_ALLOCATION_SYSTEM_PROMPT = """\
+Bạn là module phân bổ cuối cùng của baseline B5. Phối hợp tình huống gốc, dữ kiện
+có cấu trúc, phân tích vấn đề và lập luận pháp luật đã cung cấp để trực tiếp trả
+kết quả phân chia cuối cùng theo đúng allocation schema. Không tạo thêm module,
+không verifier, không repair, không abstain và không suy đoán đáp án tham chiếu.
+"""
+
+
+def _b5_statute_context(retrieved_statutes: list[dict[str, Any]]) -> str:
+    return "\n\n".join(
+        "\n".join([
+            f"[STATUTE {rank}] {row['id']}",
+            f"Văn bản: {row['metadata'].get('document_title', '')}",
+            f"Hiệu lực: {row['metadata'].get('effective_from')} đến {row['metadata'].get('effective_to')}",
+            row["text"],
+        ])
+        for rank, row in enumerate(retrieved_statutes, 1)
+    )
+
+
+def b5_extraction_user_prompt(case_id: str, query: str) -> str:
+    return f"case_id: {case_id}\n\nTình huống:\n{query}\n\nHãy trích xuất dữ kiện được hỗ trợ trực tiếp."
+
+
+def b5_issue_user_prompt(
+    case_id: str, query: str, extraction: dict[str, Any],
+    retrieved_statutes: list[dict[str, Any]],
+) -> str:
+    return (
+        f"case_id: {case_id}\n\nTình huống:\n{query}\n\n"
+        f"Dữ kiện có cấu trúc:\n{json.dumps(extraction, ensure_ascii=False)}\n\n"
+        f"Văn bản luật B4 hybrid truy xuất:\n{_b5_statute_context(retrieved_statutes)}\n\n"
+        "Hãy phân tích vấn đề pháp lý; không phân bổ cuối cùng."
+    )
+
+
+def b5_reasoning_user_prompt(
+    case_id: str, extraction: dict[str, Any], issues: dict[str, Any],
+    retrieved_statutes: list[dict[str, Any]],
+) -> str:
+    return (
+        f"case_id: {case_id}\n\n"
+        f"Dữ kiện có cấu trúc:\n{json.dumps(extraction, ensure_ascii=False)}\n\n"
+        f"Phân tích vấn đề:\n{json.dumps(issues, ensure_ascii=False)}\n\n"
+        f"Văn bản luật B4 hybrid truy xuất:\n{_b5_statute_context(retrieved_statutes)}\n\n"
+        "Hãy lập luận và tính toán trung gian; không trả allocation cuối cùng."
+    )
+
+
+def b5_allocation_user_prompt(
+    case_id: str, query: str, extraction: dict[str, Any],
+    issues: dict[str, Any], reasoning: dict[str, Any],
+) -> str:
+    return (
+        f"case_id: {case_id}\n\nTình huống gốc:\n{query}\n\n"
+        f"Dữ kiện có cấu trúc:\n{json.dumps(extraction, ensure_ascii=False)}\n\n"
+        f"Phân tích vấn đề:\n{json.dumps(issues, ensure_ascii=False)}\n\n"
+        f"Lập luận pháp luật:\n{json.dumps(reasoning, ensure_ascii=False)}\n\n"
+        "Hãy trả kết quả phân chia cuối cùng theo allocation schema."
+    )
+
+
+_NULLABLE_STRING = {"type": ["string", "null"]}
+_NULLABLE_INTEGER = {"type": ["integer", "null"]}
+
+B5_EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "required": ["case_id", "persons", "relationships", "succession_openings", "assets", "obligations", "wills_gifts_transfers", "explicit_uncertainties"],
+    "properties": {
+        "case_id": {"type": "string"},
+        "persons": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["name", "stated_role", "death_date"], "properties": {
+                "name": {"type": "string"}, "stated_role": {"type": "string"}, "death_date": _NULLABLE_STRING}}},
+        "relationships": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["person_a", "relationship", "person_b", "details"], "properties": {
+                "person_a": {"type": "string"}, "relationship": {"type": "string"}, "person_b": {"type": "string"}, "details": {"type": "string"}}}},
+        "succession_openings": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["decedent", "date", "details"], "properties": {
+                "decedent": {"type": "string"}, "date": _NULLABLE_STRING, "details": {"type": "string"}}}},
+        "assets": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["description", "value_vnd", "stated_ownership"], "properties": {
+                "description": {"type": "string"}, "value_vnd": _NULLABLE_INTEGER, "stated_ownership": {"type": "string"}}}},
+        "obligations": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["description", "amount_vnd"], "properties": {
+                "description": {"type": "string"}, "amount_vnd": _NULLABLE_INTEGER}}},
+        "wills_gifts_transfers": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["kind", "actor", "beneficiary", "date", "details"], "properties": {
+                "kind": {"type": "string"}, "actor": {"type": "string"}, "beneficiary": _NULLABLE_STRING,
+                "date": _NULLABLE_STRING, "details": {"type": "string"}}}},
+        "explicit_uncertainties": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+B5_ISSUE_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "required": ["case_id", "succession_modes", "succession_order", "will_issues", "representation_issues", "mandatory_share_issues", "estate_issues", "obligation_issues", "multi_stage_issues", "other_issues", "fact_issue_links", "unresolved_ambiguities"],
+    "properties": {
+        "case_id": {"type": "string"},
+        **{field: {"type": "array", "items": {"type": "string"}} for field in [
+            "succession_modes", "succession_order", "will_issues", "representation_issues",
+            "mandatory_share_issues", "estate_issues", "obligation_issues", "multi_stage_issues",
+            "other_issues", "unresolved_ambiguities"]},
+        "fact_issue_links": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["fact", "issue", "explanation"], "properties": {
+                "fact": {"type": "string"}, "issue": {"type": "string"}, "explanation": {"type": "string"}}}},
+    },
+}
+
+B5_REASONING_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "required": ["case_id", "applicable_statutes", "reasoning_steps", "intermediate_calculations", "intermediate_succession_states", "assumptions", "unresolved_ambiguities"],
+    "properties": {
+        "case_id": {"type": "string"},
+        "applicable_statutes": {"type": "array", "items": {"type": "string"}},
+        "reasoning_steps": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["step", "facts", "statutes", "conclusion"], "properties": {
+                "step": {"type": "integer"}, "facts": {"type": "array", "items": {"type": "string"}},
+                "statutes": {"type": "array", "items": {"type": "string"}}, "conclusion": {"type": "string"}}}},
+        "intermediate_calculations": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["description", "expression", "result_vnd"], "properties": {
+                "description": {"type": "string"}, "expression": {"type": "string"}, "result_vnd": _NULLABLE_INTEGER}}},
+        "intermediate_succession_states": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["opening", "decedent", "state"], "properties": {
+                "opening": {"type": "integer"}, "decedent": {"type": "string"}, "state": {"type": "string"}}}},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "unresolved_ambiguities": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
 APPLICABILITY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,

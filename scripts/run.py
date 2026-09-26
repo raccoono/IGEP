@@ -1,7 +1,7 @@
 """Small, resumable runner for IGEP model experiments.
 
 Available now:
-  * B0 monolithic closed-book final-allocation baseline;
+  * B0 closed-book, B2 BM25-RAG, and B4 hybrid-RAG allocation baselines;
   * extraction baselines and IGEP extraction on the 150-case benchmark;
   * Voyage statute-corpus indexing and dense search.
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -30,6 +31,19 @@ from typing import Any, Iterable
 from build_gold import graph_validation_errors, validate_instance
 from igep_specs import (
     ABLATIONS,
+    B2_ALLOCATION_PROMPT_VERSION,
+    B2_ALLOCATION_SYSTEM_PROMPT,
+    B4_ALLOCATION_PROMPT_VERSION,
+    B4_ALLOCATION_SYSTEM_PROMPT,
+    B5_ALLOCATION_SYSTEM_PROMPT,
+    B5_EXTRACTION_SCHEMA,
+    B5_EXTRACTION_SYSTEM_PROMPT,
+    B5_ISSUE_SCHEMA,
+    B5_ISSUE_SYSTEM_PROMPT,
+    B5_MODULE_ORDER,
+    B5_PROMPT_VERSION,
+    B5_REASONING_SCHEMA,
+    B5_REASONING_SYSTEM_PROMPT,
     DIAGNOSTICS,
     DEFAULT_EXTRACTION_PROMPT,
     DIRECT_ALLOCATION_PROMPT_VERSION,
@@ -50,6 +64,12 @@ from igep_specs import (
     STAGED_RELATIONSHIP_SYSTEM_PROMPT,
     STAGED_SCHEMAS,
     extraction_user_prompt,
+    b2_allocation_user_prompt,
+    b4_allocation_user_prompt,
+    b5_allocation_user_prompt,
+    b5_extraction_user_prompt,
+    b5_issue_user_prompt,
+    b5_reasoning_user_prompt,
     direct_allocation_user_prompt,
     raw_schema_instruction,
     repair_user_prompt,
@@ -60,11 +80,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "canonical" / "input.jsonl"
 DEFAULT_RUN_DIR = PROJECT_ROOT / "data" / "runs"
 DEFAULT_SPLIT_MANIFEST = PROJECT_ROOT / "data" / "release" / "split.csv"
+DEFAULT_STATUTE_CORPUS = (
+    PROJECT_ROOT / "data" / "legal_corpus" / "normalized" / "statutes.jsonl"
+)
 B0_DEFAULT_MODEL = "gpt-5-mini-2025-08-07"
 B0_DEFAULT_REASONING_EFFORT = "low"
 B0_DEFAULT_MAX_OUTPUT_TOKENS = 6000
 B0_DEFAULT_TIMEOUT_SECONDS = 120
 B0_DEFAULT_ATTEMPTS = 2
+B2_RETRIEVAL_TOP_K = 5
+BM25_K1 = 1.5
+BM25_B = 0.75
+B4_BM25_CANDIDATE_K = 20
+B4_DENSE_CANDIDATE_K = 20
+B4_RRF_K = 60
+B4_FINAL_TOP_K = 5
+B4_DENSE_METRIC = "cosine"
+DEFAULT_DENSE_CACHE = PROJECT_ROOT / "data" / "cache" / "statute_embeddings_voyage.jsonl"
 
 
 def b0_config() -> dict[str, Any]:
@@ -87,6 +119,51 @@ def b0_config() -> dict[str, Any]:
         "attempts": int(env("B0_ATTEMPTS", str(B0_DEFAULT_ATTEMPTS))),
         "prompt_version": DIRECT_ALLOCATION_PROMPT_VERSION,
     }
+
+
+def b2_config() -> dict[str, Any]:
+    """Use the frozen B0 inference settings; retrieval is the sole intervention."""
+    config = b0_config()
+    config["prompt_version"] = B2_ALLOCATION_PROMPT_VERSION
+    config.update(
+        {
+            "retrieval_method": "bm25",
+            "retrieval_top_k": B2_RETRIEVAL_TOP_K,
+            "bm25_k1": BM25_K1,
+            "bm25_b": BM25_B,
+        }
+    )
+    return config
+
+
+def b4_config() -> dict[str, Any]:
+    """Frozen B0 inference plus the specified hybrid retrieval intervention."""
+    config = b0_config()
+    config["prompt_version"] = B4_ALLOCATION_PROMPT_VERSION
+    config.update(
+        {
+            "retrieval_method": "hybrid",
+            "bm25_k1": BM25_K1,
+            "bm25_b": BM25_B,
+            "bm25_candidate_k": B4_BM25_CANDIDATE_K,
+            "dense_model": env("VOYAGE_MODEL", "voyage-4-large"),
+            "dense_metric": B4_DENSE_METRIC,
+            "dense_candidate_k": B4_DENSE_CANDIDATE_K,
+            "dense_output_dimension": int(env("VOYAGE_OUTPUT_DIMENSION", "1024")),
+            "rrf_k": B4_RRF_K,
+            "final_top_k": B4_FINAL_TOP_K,
+        }
+    )
+    return config
+
+
+def b5_config() -> dict[str, Any]:
+    """Use frozen B4 retrieval and B0 inference for modular coordination."""
+    config = b4_config()
+    config["prompt_version"] = B5_PROMPT_VERSION
+    config["retrieval_method"] = "b4_hybrid"
+    config["logical_llm_calls"] = len(B5_MODULE_ORDER)
+    return config
 
 
 def split_case_ids(path: Path, split: str) -> set[str]:
@@ -625,6 +702,278 @@ def b0_trace_record(
     }
 
 
+def b2_trace_record(
+    case_id: str,
+    split: str,
+    started: float,
+    config: dict[str, Any],
+    retrieved_statute_ids: list[str],
+    corpus_path: Path,
+    corpus_sha256: str,
+    *,
+    response: dict[str, Any] | None = None,
+    errors: list[str] | None = None,
+    exception: Exception | None = None,
+) -> dict[str, Any]:
+    """B2 trace: frozen B0 settings plus deterministic BM25 provenance."""
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "case_id": case_id,
+        "split": split,
+        "method": "b2",
+        "model": config["model"],
+        "reasoning_effort": config["reasoning_effort"],
+        "max_output_tokens": config["max_output_tokens"],
+        "temperature": config["temperature"],
+        "timeout_seconds": config["timeout_seconds"],
+        "attempt_count": config["attempts"],
+        "retry_count": max(config["attempts"] - 1, 0),
+        "prompt_version": config["prompt_version"],
+        "retrieval_method": config["retrieval_method"],
+        "retrieval_top_k": config["retrieval_top_k"],
+        "bm25_k1": config["bm25_k1"],
+        "bm25_b": config["bm25_b"],
+        "retrieval_query_source": "raw_case_text",
+        "statute_corpus": str(corpus_path),
+        "statute_corpus_sha256": corpus_sha256,
+        "retrieved_statute_ids": retrieved_statute_ids,
+        "response_id": response.get("id") if response else None,
+        "usage": response.get("usage") if response else None,
+        "structural_validation_errors": errors or [],
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "error": str(exception) if exception else None,
+    }
+
+
+def b4_trace_record(
+    case_id: str,
+    split: str,
+    started: float,
+    config: dict[str, Any],
+    bm25_statute_ids: list[str],
+    dense_statute_ids: list[str],
+    retrieved_statute_ids: list[str],
+    corpus_path: Path,
+    corpus_sha256: str,
+    *,
+    response: dict[str, Any] | None = None,
+    errors: list[str] | None = None,
+    exception: Exception | None = None,
+    dense_usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """B4 trace with complete hybrid-retrieval and inference provenance."""
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "case_id": case_id,
+        "split": split,
+        "method": "b4",
+        "model": config["model"],
+        "reasoning_effort": config["reasoning_effort"],
+        "max_output_tokens": config["max_output_tokens"],
+        "temperature": config["temperature"],
+        "timeout_seconds": config["timeout_seconds"],
+        "attempts": config["attempts"],
+        "attempt_count": config["attempts"],
+        "retry_count": max(config["attempts"] - 1, 0),
+        "prompt_version": config["prompt_version"],
+        "retrieval_method": config["retrieval_method"],
+        "bm25_k1": config["bm25_k1"],
+        "bm25_b": config["bm25_b"],
+        "bm25_candidate_k": config["bm25_candidate_k"],
+        "dense_model": config["dense_model"],
+        "dense_metric": config["dense_metric"],
+        "dense_candidate_k": config["dense_candidate_k"],
+        "dense_output_dimension": config["dense_output_dimension"],
+        "rrf_k": config["rrf_k"],
+        "final_top_k": config["final_top_k"],
+        "query_source": "raw_case_text",
+        "corpus_path": str(corpus_path),
+        "corpus_sha256": corpus_sha256,
+        "bm25_statute_ids": bm25_statute_ids,
+        "dense_statute_ids": dense_statute_ids,
+        "retrieved_statute_ids": retrieved_statute_ids,
+        "dense_usage": dense_usage or {},
+        "response_id": response.get("id") if response else None,
+        "usage": response.get("usage") if response else None,
+        "validation_errors": errors or [],
+        "structural_validation_errors": errors or [],
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "runtime_error": str(exception) if exception else None,
+        "error": str(exception) if exception else None,
+    }
+
+
+class B5ModuleError(RuntimeError):
+    """Stops B5 at the failing module while preserving completed trace data."""
+
+    def __init__(self, message: str, modules: list[dict[str, Any]]):
+        super().__init__(message)
+        self.modules = modules
+
+
+def run_b5_modules(
+    case_id: str,
+    query: str,
+    retrieved: list[dict[str, Any]],
+    config: dict[str, Any],
+    *,
+    call_fn=None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Execute four distinct B5 LLM modules with no repair or verifier loop."""
+    call = call_fn or openai_call
+    modules: list[dict[str, Any]] = []
+    extraction: dict[str, Any] | None = None
+    issues: dict[str, Any] | None = None
+    reasoning: dict[str, Any] | None = None
+    specifications = [
+        (
+            "structured_case_extraction", B5_EXTRACTION_SYSTEM_PROMPT,
+            lambda: b5_extraction_user_prompt(case_id, query),
+            B5_EXTRACTION_SCHEMA, "b5_case_extraction_v1",
+        ),
+        (
+            "inheritance_issue_analysis", B5_ISSUE_SYSTEM_PROMPT,
+            lambda: b5_issue_user_prompt(case_id, query, extraction, retrieved),
+            B5_ISSUE_SCHEMA, "b5_issue_analysis_v1",
+        ),
+        (
+            "statute_aware_reasoning", B5_REASONING_SYSTEM_PROMPT,
+            lambda: b5_reasoning_user_prompt(case_id, extraction, issues, retrieved),
+            B5_REASONING_SCHEMA, "b5_statute_reasoning_v1",
+        ),
+        (
+            "coordinated_final_allocation", B5_ALLOCATION_SYSTEM_PROMPT,
+            lambda: b5_allocation_user_prompt(case_id, query, extraction, issues, reasoning),
+            DIRECT_ALLOCATION_SCHEMA, "igep_direct_allocation_v1",
+        ),
+    ]
+    final_prediction: dict[str, Any] | None = None
+    for module_name, system_prompt, user_prompt_fn, schema, schema_name in specifications:
+        started = time.perf_counter()
+        response: dict[str, Any] | None = None
+        try:
+            output, response = call(
+                system_prompt,
+                user_prompt_fn(),
+                structured=True,
+                output_schema=schema,
+                schema_name=schema_name,
+                model=config["model"],
+                reasoning_effort=config["reasoning_effort"],
+                max_output_tokens=config["max_output_tokens"],
+                timeout_seconds=config["timeout_seconds"],
+                attempts=config["attempts"],
+            )
+            output["case_id"] = case_id
+            errors = validate_instance(output, schema, schema)
+            module_record = {
+                "module": module_name,
+                "response_id": response.get("id") if response else None,
+                "usage": response.get("usage") if response else None,
+                "output": output,
+                "validation_errors": errors,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+                "runtime_error": None,
+            }
+            modules.append(module_record)
+            if errors:
+                raise B5ModuleError(
+                    f"{module_name}: " + "; ".join(errors[:10]), modules
+                )
+            if module_name == "structured_case_extraction":
+                extraction = output
+            elif module_name == "inheritance_issue_analysis":
+                issues = output
+            elif module_name == "statute_aware_reasoning":
+                reasoning = output
+            else:
+                final_prediction = output
+        except B5ModuleError:
+            raise
+        except Exception as exc:
+            modules.append({
+                "module": module_name,
+                "response_id": response.get("id") if response else None,
+                "usage": response.get("usage") if response else None,
+                "output": None,
+                "validation_errors": [],
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+                "runtime_error": str(exc),
+            })
+            raise B5ModuleError(f"{module_name}: {exc}", modules) from exc
+    if final_prediction is None:
+        raise B5ModuleError("B5 produced no final allocation", modules)
+    total_usage = merge_numeric_dicts([
+        module["usage"] for module in modules if isinstance(module.get("usage"), dict)
+    ])
+    return final_prediction, modules, total_usage
+
+
+def b5_trace_record(
+    case_id: str,
+    split: str,
+    started: float,
+    config: dict[str, Any],
+    bm25_statute_ids: list[str],
+    dense_statute_ids: list[str],
+    retrieved_statute_ids: list[str],
+    corpus_path: Path,
+    corpus_sha256: str,
+    modules: list[dict[str, Any]],
+    *,
+    total_usage: dict[str, Any] | None = None,
+    errors: list[str] | None = None,
+    exception: Exception | None = None,
+    dense_usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "case_id": case_id,
+        "split": split,
+        "method": "b5",
+        "model": config["model"],
+        "reasoning": config["reasoning_effort"],
+        "reasoning_effort": config["reasoning_effort"],
+        "max_output_tokens": config["max_output_tokens"],
+        "temperature": config["temperature"],
+        "timeout_seconds": config["timeout_seconds"],
+        "attempts": config["attempts"],
+        "retry_count": max(config["attempts"] - 1, 0),
+        "prompt_version": config["prompt_version"],
+        "retrieval_method": config["retrieval_method"],
+        "bm25_k1": config["bm25_k1"],
+        "bm25_b": config["bm25_b"],
+        "bm25_candidate_k": config["bm25_candidate_k"],
+        "dense_model": config["dense_model"],
+        "dense_metric": config["dense_metric"],
+        "dense_candidate_k": config["dense_candidate_k"],
+        "dense_output_dimension": config["dense_output_dimension"],
+        "rrf_k": config["rrf_k"],
+        "final_top_k": config["final_top_k"],
+        "query_source": "raw_case_text",
+        "corpus_path": str(corpus_path),
+        "corpus_sha256": corpus_sha256,
+        "bm25_statute_ids": bm25_statute_ids,
+        "dense_statute_ids": dense_statute_ids,
+        "retrieved_statute_ids": retrieved_statute_ids,
+        "logical_llm_calls_planned": config["logical_llm_calls"],
+        "logical_llm_calls_attempted": len(modules),
+        "logical_llm_calls_completed": sum(
+            not module.get("runtime_error") and not module.get("validation_errors")
+            for module in modules
+        ),
+        "module_execution_order": list(B5_MODULE_ORDER),
+        "modules": modules,
+        "module_response_ids": [module.get("response_id") for module in modules],
+        "module_usage": {module["module"]: module.get("usage") for module in modules},
+        "total_usage": total_usage or {},
+        "dense_usage": dense_usage or {},
+        "validation_errors": errors or [],
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "runtime_error": str(exception) if exception else None,
+    }
+
+
 def run_extract(args: argparse.Namespace) -> None:
     method = EXTRACTION_METHODS[args.method]
     system_prompt = EXTRACTION_PROMPTS[args.prompt_version]
@@ -766,10 +1115,11 @@ def run_extract(args: argparse.Namespace) -> None:
 
 
 def run_allocate(args: argparse.Namespace) -> None:
-    """Run the frozen B0 monolithic closed-book allocation baseline."""
-    output = args.output or DEFAULT_RUN_DIR / "allocation_dev_b0.jsonl"
+    """Run frozen allocation baselines B0, B2, B4, or modular B5."""
+    method = args.method
+    output = args.output or DEFAULT_RUN_DIR / f"allocation_dev_{method}.jsonl"
     trace = args.trace or output.with_name(output.stem + ".trace.jsonl")
-    config = b0_config()
+    config = {"b0": b0_config, "b2": b2_config, "b4": b4_config, "b5": b5_config}[method]()
     records = load_records(args.input)
     if args.split == "test" and not args.allow_held_out_test:
         raise ValueError(
@@ -786,39 +1136,183 @@ def run_allocate(args: argparse.Namespace) -> None:
     if not records:
         raise RuntimeError("No matching input records")
 
+    corpus_path = args.statute_corpus
+    corpus_rows: list[dict[str, Any]] = []
+    corpus_sha256 = ""
+    if method in {"b2", "b4", "b5"}:
+        corpus_rows = [
+            search_row(row, "citation_id", "retrieval_text")
+            for row in load_records(corpus_path)
+        ]
+        if not corpus_rows:
+            raise RuntimeError(f"Empty statute corpus: {corpus_path}")
+        corpus_sha256 = hashlib.sha256(corpus_path.read_bytes()).hexdigest()
+
     if args.dry_run:
         case_id, query = normalized_case(records[0])
-        print(json.dumps({
-            "method": "b0", "label": "B0 monolithic closed-book LLM",
+        bm25_hits: list[dict[str, Any]] = []
+        dense_hits: list[dict[str, Any]] = []
+        if method == "b2":
+            retrieved = bm25_retrieve(corpus_rows, query, B2_RETRIEVAL_TOP_K)
+        elif method in {"b4", "b5"}:
+            fake_dimension = 32
+            fake_rows = [
+                {**row, "embedding": deterministic_fake_embedding(row["text"], fake_dimension)}
+                for row in corpus_rows
+            ]
+            bm25_hits, dense_hits, retrieved = hybrid_retrieve(
+                corpus_rows, fake_rows, query,
+                deterministic_fake_embedding(query, fake_dimension), config,
+            )
+        else:
+            retrieved = []
+        system_prompt = None
+        user_prompt = None
+        module_requests: list[dict[str, Any]] = []
+        if method != "b5":
+            system_prompt = {
+                "b0": DIRECT_ALLOCATION_SYSTEM_PROMPT,
+                "b2": B2_ALLOCATION_SYSTEM_PROMPT,
+                "b4": B4_ALLOCATION_SYSTEM_PROMPT,
+            }[method]
+            user_prompt = {
+                "b0": lambda: direct_allocation_user_prompt(case_id, query),
+                "b2": lambda: b2_allocation_user_prompt(case_id, query, retrieved),
+                "b4": lambda: b4_allocation_user_prompt(case_id, query, retrieved),
+            }[method]()
+        else:
+            empty_extraction = {
+                "case_id": case_id, "persons": [], "relationships": [],
+                "succession_openings": [], "assets": [], "obligations": [],
+                "wills_gifts_transfers": [], "explicit_uncertainties": [],
+            }
+            empty_issues = {
+                "case_id": case_id, "succession_modes": [], "succession_order": [],
+                "will_issues": [], "representation_issues": [], "mandatory_share_issues": [],
+                "estate_issues": [], "obligation_issues": [], "multi_stage_issues": [],
+                "other_issues": [], "fact_issue_links": [], "unresolved_ambiguities": [],
+            }
+            empty_reasoning = {
+                "case_id": case_id, "applicable_statutes": [], "reasoning_steps": [],
+                "intermediate_calculations": [], "intermediate_succession_states": [],
+                "assumptions": [], "unresolved_ambiguities": [],
+            }
+            module_requests = [
+                {"module": B5_MODULE_ORDER[0], "system_prompt": B5_EXTRACTION_SYSTEM_PROMPT,
+                 "user_prompt": b5_extraction_user_prompt(case_id, query), "output_schema": B5_EXTRACTION_SCHEMA},
+                {"module": B5_MODULE_ORDER[1], "system_prompt": B5_ISSUE_SYSTEM_PROMPT,
+                 "user_prompt": b5_issue_user_prompt(case_id, query, empty_extraction, retrieved), "output_schema": B5_ISSUE_SCHEMA},
+                {"module": B5_MODULE_ORDER[2], "system_prompt": B5_REASONING_SYSTEM_PROMPT,
+                 "user_prompt": b5_reasoning_user_prompt(case_id, empty_extraction, empty_issues, retrieved), "output_schema": B5_REASONING_SCHEMA},
+                {"module": B5_MODULE_ORDER[3], "system_prompt": B5_ALLOCATION_SYSTEM_PROMPT,
+                 "user_prompt": b5_allocation_user_prompt(case_id, query, empty_extraction, empty_issues, empty_reasoning), "output_schema": DIRECT_ALLOCATION_SCHEMA},
+            ]
+        dry_run_record = {
+            "method": method,
+            "label": (
+                "B0 monolithic closed-book LLM"
+                if method == "b0"
+                else "B2 BM25-RAG direct allocation"
+                if method == "b2"
+                else "B4 hybrid-RAG direct allocation"
+                if method == "b4"
+                else "B5 coordinated modular LLM"
+            ),
             "configuration": config,
             "case_id": case_id,
-            "system_prompt": DIRECT_ALLOCATION_SYSTEM_PROMPT,
-            "user_prompt": direct_allocation_user_prompt(case_id, query),
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
             "output_schema": DIRECT_ALLOCATION_SCHEMA,
-        }, ensure_ascii=False, indent=2))
+        }
+        if method in {"b2", "b4", "b5"}:
+            dry_run_record.update(
+                {
+                    "retrieved_statute_ids": [row["id"] for row in retrieved],
+                    "statute_corpus": str(corpus_path),
+                    "statute_corpus_sha256": corpus_sha256,
+                }
+            )
+        if method in {"b4", "b5"}:
+            dry_run_record.update({
+                "dry_run_dense_source": "deterministic_fake_embeddings",
+                "bm25_statute_ids": [row["id"] for row in bm25_hits],
+                "dense_statute_ids": [row["id"] for row in dense_hits],
+                "retrieved_statute_ids": [row["id"] for row in retrieved],
+            })
+        if method == "b5":
+            dry_run_record.update({
+                "module_execution_order": list(B5_MODULE_ORDER),
+                "logical_llm_calls": len(B5_MODULE_ORDER),
+                "module_requests": module_requests,
+            })
+        print(json.dumps(dry_run_record, ensure_ascii=False, indent=2))
         return
 
     env("OPENAI_API_KEY", required=True)
+    embedded_rows: list[dict[str, Any]] = []
+    dense_cache_usage: dict[str, Any] = {}
+    if method in {"b4", "b5"}:
+        embedded_rows, dense_cache_usage = load_or_build_dense_cache(
+            corpus_rows, args.dense_cache, corpus_sha256, config,
+            batch_size=args.dense_batch_size,
+        )
     completed = existing_case_ids(output) if args.resume else set()
     selected = [r for r in records if normalized_case(r)[0] not in completed]
-    print(f"B0 monolithic allocation: {len(selected)} pending / {len(records)} selected; output={output}")
+    label = {
+        "b0": "B0 monolithic allocation",
+        "b2": "B2 BM25-RAG allocation",
+        "b4": "B4 hybrid-RAG allocation",
+        "b5": "B5 coordinated modular allocation",
+    }[method]
+    print(f"{label}: {len(selected)} pending / {len(records)} selected; output={output}")
     for index, record in enumerate(selected, 1):
         case_id, query = normalized_case(record)
         started = time.perf_counter()
         response = None
+        retrieved: list[dict[str, Any]] = []
+        bm25_hits: list[dict[str, Any]] = []
+        dense_hits: list[dict[str, Any]] = []
+        dense_usage = dict(dense_cache_usage)
+        modules: list[dict[str, Any]] = []
+        total_usage: dict[str, Any] = {}
         try:
-            prediction, response = openai_call(
-                DIRECT_ALLOCATION_SYSTEM_PROMPT,
-                direct_allocation_user_prompt(case_id, query),
-                structured=True,
-                output_schema=DIRECT_ALLOCATION_SCHEMA,
-                schema_name="igep_direct_allocation_v1",
-                model=config["model"],
-                reasoning_effort=config["reasoning_effort"],
-                max_output_tokens=config["max_output_tokens"],
-                timeout_seconds=config["timeout_seconds"],
-                attempts=config["attempts"],
-            )
+            if method == "b2":
+                retrieved = bm25_retrieve(corpus_rows, query, B2_RETRIEVAL_TOP_K)
+            elif method in {"b4", "b5"}:
+                query_vectors, query_tokens = voyage_embed([query], "query")
+                if len(query_vectors[0]) != config["dense_output_dimension"]:
+                    raise ValueError("Voyage query embedding dimension does not match B4 configuration")
+                dense_usage["query_embedding_tokens"] = query_tokens
+                bm25_hits, dense_hits, retrieved = hybrid_retrieve(
+                    corpus_rows, embedded_rows, query, query_vectors[0], config,
+                )
+            if method == "b5":
+                prediction, modules, total_usage = run_b5_modules(
+                    case_id, query, retrieved, config
+                )
+            else:
+                system_prompt = {
+                    "b0": DIRECT_ALLOCATION_SYSTEM_PROMPT,
+                    "b2": B2_ALLOCATION_SYSTEM_PROMPT,
+                    "b4": B4_ALLOCATION_SYSTEM_PROMPT,
+                }[method]
+                user_prompt = {
+                    "b0": lambda: direct_allocation_user_prompt(case_id, query),
+                    "b2": lambda: b2_allocation_user_prompt(case_id, query, retrieved),
+                    "b4": lambda: b4_allocation_user_prompt(case_id, query, retrieved),
+                }[method]()
+                prediction, response = openai_call(
+                    system_prompt,
+                    user_prompt,
+                    structured=True,
+                    output_schema=DIRECT_ALLOCATION_SCHEMA,
+                    schema_name="igep_direct_allocation_v1",
+                    model=config["model"],
+                    reasoning_effort=config["reasoning_effort"],
+                    max_output_tokens=config["max_output_tokens"],
+                    timeout_seconds=config["timeout_seconds"],
+                    attempts=config["attempts"],
+                )
             prediction["case_id"] = case_id
             errors = validate_instance(
                 prediction, DIRECT_ALLOCATION_SCHEMA, DIRECT_ALLOCATION_SCHEMA
@@ -826,16 +1320,74 @@ def run_allocate(args: argparse.Namespace) -> None:
             if errors:
                 raise ValueError("; ".join(errors[:10]))
             append_jsonl(output, prediction)
-            append_jsonl(trace, b0_trace_record(
-                case_id, args.split, started, config,
-                response=response, errors=errors,
-            ))
+            if method == "b0":
+                trace_row = b0_trace_record(
+                    case_id, args.split, started, config,
+                    response=response, errors=errors,
+                )
+            elif method == "b2":
+                trace_row = b2_trace_record(
+                    case_id, args.split, started, config,
+                    [row["id"] for row in retrieved], corpus_path,
+                    corpus_sha256, response=response, errors=errors,
+                )
+            elif method == "b4":
+                trace_row = b4_trace_record(
+                    case_id, args.split, started, config,
+                    [row["id"] for row in bm25_hits],
+                    [row["id"] for row in dense_hits],
+                    [row["id"] for row in retrieved], corpus_path,
+                    corpus_sha256, response=response, errors=errors,
+                    dense_usage=dense_usage,
+                )
+            else:
+                trace_row = b5_trace_record(
+                    case_id, args.split, started, config,
+                    [row["id"] for row in bm25_hits],
+                    [row["id"] for row in dense_hits],
+                    [row["id"] for row in retrieved], corpus_path,
+                    corpus_sha256, modules, total_usage=total_usage,
+                    errors=errors, dense_usage=dense_usage,
+                )
+            append_jsonl(trace, trace_row)
             print(f"[{index}/{len(selected)}] case {case_id}: complete")
         except Exception as exc:
-            append_jsonl(trace, b0_trace_record(
-                case_id, args.split, started, config,
-                response=response, exception=exc,
-            ))
+            if isinstance(exc, B5ModuleError):
+                modules = exc.modules
+                total_usage = merge_numeric_dicts([
+                    module["usage"] for module in modules
+                    if isinstance(module.get("usage"), dict)
+                ])
+            if method == "b0":
+                trace_row = b0_trace_record(
+                    case_id, args.split, started, config,
+                    response=response, exception=exc,
+                )
+            elif method == "b2":
+                trace_row = b2_trace_record(
+                    case_id, args.split, started, config,
+                    [row["id"] for row in retrieved], corpus_path,
+                    corpus_sha256, response=response, exception=exc,
+                )
+            elif method == "b4":
+                trace_row = b4_trace_record(
+                    case_id, args.split, started, config,
+                    [row["id"] for row in bm25_hits],
+                    [row["id"] for row in dense_hits],
+                    [row["id"] for row in retrieved], corpus_path,
+                    corpus_sha256, response=response, exception=exc,
+                    dense_usage=dense_usage,
+                )
+            else:
+                trace_row = b5_trace_record(
+                    case_id, args.split, started, config,
+                    [row["id"] for row in bm25_hits],
+                    [row["id"] for row in dense_hits],
+                    [row["id"] for row in retrieved], corpus_path,
+                    corpus_sha256, modules, total_usage=total_usage,
+                    exception=exc, dense_usage=dense_usage,
+                )
+            append_jsonl(trace, trace_row)
             print(f"[{index}/{len(selected)}] case {case_id}: ERROR {exc}", file=sys.stderr)
 
 
@@ -877,7 +1429,11 @@ def run_index(args: argparse.Namespace) -> None:
 
 
 def cosine(a: list[float], b: list[float]) -> float:
-    numerator = sum(x * y for x, y in zip(a, b, strict=True))
+    if len(a) != len(b):
+        raise ValueError("Cosine vectors must have equal dimensions")
+    # Explicit length validation preserves ``zip(strict=True)`` semantics on
+    # the project's supported Python 3.9 runtime.
+    numerator = sum(x * y for x, y in zip(a, b))
     denominator = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
     return numerator / denominator if denominator else 0.0
 
@@ -923,8 +1479,10 @@ def bm25_scores(rows: list[dict[str, Any]], query: str) -> dict[str, float]:
         term for document in documents for term in set(document)
     )
     scores: dict[str, float] = {}
-    k1, b = 1.5, 0.75
-    for row, document in zip(rows, documents, strict=True):
+    # ``documents`` is constructed one-for-one from ``rows`` above. Avoid
+    # zip(strict=True) so the frozen BM25 baseline runs on the project's
+    # supported Python 3.9 environment.
+    for row, document in zip(rows, documents):
         term_frequency = Counter(document)
         score = 0.0
         for term in query_terms:
@@ -935,12 +1493,184 @@ def bm25_scores(rows: list[dict[str, Any]], query: str) -> dict[str, float]:
                 1 + (count - document_frequency[term] + 0.5)
                 / (document_frequency[term] + 0.5)
             )
-            denominator = frequency + k1 * (
-                1 - b + b * len(document) / average_length
+            denominator = frequency + BM25_K1 * (
+                1 - BM25_B + BM25_B * len(document) / average_length
             )
-            score += inverse_frequency * frequency * (k1 + 1) / denominator
+            score += (
+                inverse_frequency
+                * frequency
+                * (BM25_K1 + 1)
+                / denominator
+            )
         scores[row["id"]] = score
     return scores
+
+
+def bm25_retrieve(
+    rows: list[dict[str, Any]], query: str, top_k: int = B2_RETRIEVAL_TOP_K
+) -> list[dict[str, Any]]:
+    """Return deterministic BM25 hits, breaking equal scores by stable ID."""
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    scores = bm25_scores(rows, query)
+    ordered = sorted(rows, key=lambda row: (-scores[row["id"]], row["id"]))
+    return [
+        {**row, "bm25_score": scores[row["id"]]}
+        for row in ordered[:top_k]
+    ]
+
+
+def dense_retrieve(
+    rows: list[dict[str, Any]],
+    query_embedding: list[float],
+    top_k: int = B4_DENSE_CANDIDATE_K,
+) -> list[dict[str, Any]]:
+    """Rank embedded corpus rows by cosine, with citation ID tie-breaking."""
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    scored: list[tuple[dict[str, Any], float]] = []
+    for row in rows:
+        embedding = row.get("embedding")
+        if not isinstance(embedding, list):
+            raise ValueError(f"Missing dense embedding for {row['id']}")
+        if len(embedding) != len(query_embedding):
+            raise ValueError(f"Embedding dimension mismatch for {row['id']}")
+        scored.append((row, cosine(query_embedding, embedding)))
+    scored.sort(key=lambda item: (-item[1], item[0]["id"]))
+    return [{**row, "dense_score": score} for row, score in scored[:top_k]]
+
+
+def rrf_fuse(
+    bm25_hits: list[dict[str, Any]],
+    dense_hits: list[dict[str, Any]],
+    *,
+    rrf_k: int = B4_RRF_K,
+    top_k: int = B4_FINAL_TOP_K,
+) -> list[dict[str, Any]]:
+    """Fuse only the supplied sparse/dense candidate pools using 1-based RRF."""
+    if rrf_k < 1 or top_k < 1:
+        raise ValueError("rrf_k and top_k must be positive")
+    by_id: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
+    sparse_ranks: dict[str, int] = {}
+    dense_ranks: dict[str, int] = {}
+    for channel, channel_ranks in ((bm25_hits, sparse_ranks), (dense_hits, dense_ranks)):
+        for rank, row in enumerate(channel, 1):
+            identifier = row["id"]
+            if identifier in channel_ranks:
+                raise ValueError(f"Duplicate candidate in retrieval channel: {identifier}")
+            channel_ranks[identifier] = rank
+            by_id.setdefault(identifier, row)
+            scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (rrf_k + rank)
+    ordered_ids = sorted(scores, key=lambda identifier: (-scores[identifier], identifier))
+    return [
+        {
+            **by_id[identifier],
+            "rrf_score": scores[identifier],
+            "bm25_rank": sparse_ranks.get(identifier),
+            "dense_rank": dense_ranks.get(identifier),
+        }
+        for identifier in ordered_ids[:top_k]
+    ]
+
+
+def deterministic_fake_embedding(text: str, dimension: int = 32) -> list[float]:
+    """Local test/dry-run embedding; deliberately never used by real B4 runs."""
+    vector = [0.0] * dimension
+    for token in tokenize(text):
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        position = int.from_bytes(digest[:4], "big") % dimension
+        vector[position] += -1.0 if digest[4] & 1 else 1.0
+    return vector
+
+
+def attach_embeddings(
+    corpus_rows: list[dict[str, Any]], embeddings: dict[str, list[float]]
+) -> list[dict[str, Any]]:
+    missing = [row["id"] for row in corpus_rows if row["id"] not in embeddings]
+    extra = sorted(set(embeddings) - {row["id"] for row in corpus_rows})
+    if missing or extra:
+        raise ValueError(f"Dense cache/corpus ID mismatch: missing={missing[:5]} extra={extra[:5]}")
+    return [{**row, "embedding": embeddings[row["id"]]} for row in corpus_rows]
+
+
+def load_or_build_dense_cache(
+    corpus_rows: list[dict[str, Any]],
+    cache_path: Path,
+    corpus_sha256: str,
+    config: dict[str, Any],
+    *,
+    batch_size: int = 64,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load a validated fixed-corpus cache, or create it once with Voyage."""
+    model = config["dense_model"]
+    dimension = config["dense_output_dimension"]
+    if cache_path.exists():
+        cache_rows = load_records(cache_path)
+        embeddings: dict[str, list[float]] = {}
+        for row in cache_rows:
+            if row.get("dense_model") != model:
+                raise ValueError(f"Dense cache model mismatch in {cache_path}")
+            if row.get("dense_output_dimension") != dimension:
+                raise ValueError(f"Dense cache dimension mismatch in {cache_path}")
+            if row.get("corpus_sha256") != corpus_sha256:
+                raise ValueError(f"Dense cache corpus checksum mismatch in {cache_path}")
+            embedding = row.get("embedding")
+            if not isinstance(embedding, list) or len(embedding) != dimension:
+                raise ValueError(f"Invalid embedding in {cache_path}: {row.get('id')}")
+            identifier = str(row["id"])
+            if identifier in embeddings:
+                raise ValueError(f"Duplicate dense cache ID: {identifier}")
+            embeddings[identifier] = embedding
+        return attach_embeddings(corpus_rows, embeddings), {
+            "document_embedding_cache": str(cache_path),
+            "document_embedding_cache_hit": True,
+            "document_embedding_tokens": 0,
+        }
+
+    env("VOYAGE_API_KEY", required=True)
+    cache_rows: list[dict[str, Any]] = []
+    total_tokens = 0
+    for batch in chunks(corpus_rows, batch_size):
+        vectors, tokens = voyage_embed([row["text"] for row in batch], "document")
+        total_tokens += tokens
+        if len(batch) != len(vectors):
+            raise ValueError("Voyage document embedding count mismatch")
+        for row, vector in zip(batch, vectors):
+            if len(vector) != dimension:
+                raise ValueError(f"Voyage returned unexpected dimension for {row['id']}")
+            cache_rows.append({
+                "id": row["id"],
+                "dense_model": model,
+                "dense_output_dimension": dimension,
+                "corpus_sha256": corpus_sha256,
+                "embedding": vector,
+            })
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in cache_rows:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    temporary.replace(cache_path)
+    embeddings = {row["id"]: row["embedding"] for row in cache_rows}
+    return attach_embeddings(corpus_rows, embeddings), {
+        "document_embedding_cache": str(cache_path),
+        "document_embedding_cache_hit": False,
+        "document_embedding_tokens": total_tokens,
+    }
+
+
+def hybrid_retrieve(
+    corpus_rows: list[dict[str, Any]],
+    embedded_rows: list[dict[str, Any]],
+    query: str,
+    query_embedding: list[float],
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    sparse = bm25_retrieve(corpus_rows, query, config["bm25_candidate_k"])
+    dense = dense_retrieve(embedded_rows, query_embedding, config["dense_candidate_k"])
+    fused = rrf_fuse(sparse, dense, rrf_k=config["rrf_k"], top_k=config["final_top_k"])
+    return sparse, dense, fused
 
 
 def ranks(scores: dict[str, float]) -> dict[str, int]:
@@ -1042,7 +1772,7 @@ def run_search(args: argparse.Namespace) -> None:
 
 
 def print_registry() -> None:
-    print("Planned end-to-end baselines (only B0 is runnable now)")
+    print("End-to-end baselines (B0, B2, B4, and B5 are runnable now)")
     for method in PAPER_BASELINES:
         print(f"  {method['id']}: {method['name']} — {method['description']}")
     print(f"\nMain method\n  {MAIN_METHOD['id']}: {MAIN_METHOD['name']} — {MAIN_METHOD['description']}")
@@ -1090,10 +1820,19 @@ def parse_args() -> argparse.Namespace:
     allocate = subparsers.add_parser(
         "allocate", help="Run final heir-and-amount allocation baselines."
     )
-    allocate.add_argument("--method", choices=["b0"], default="b0")
+    allocate.add_argument("--method", choices=["b0", "b2", "b4", "b5"], default="b0")
     allocate.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     allocate.add_argument("--split", choices=["development", "test"], default="development")
     allocate.add_argument("--split-manifest", type=Path, default=DEFAULT_SPLIT_MANIFEST)
+    allocate.add_argument(
+        "--statute-corpus", type=Path, default=DEFAULT_STATUTE_CORPUS,
+        help="Canonical article-level statute corpus used by B2 and B4.",
+    )
+    allocate.add_argument(
+        "--dense-cache", type=Path, default=DEFAULT_DENSE_CACHE,
+        help="Ignored local cache for B4 statute embeddings.",
+    )
+    allocate.add_argument("--dense-batch-size", type=int, default=64)
     allocate.add_argument("--allow-held-out-test", action="store_true")
     allocate.add_argument("--output", type=Path)
     allocate.add_argument("--trace", type=Path)
